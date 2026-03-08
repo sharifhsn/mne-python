@@ -124,6 +124,100 @@ def _sum_cluster_data(data, tstep):
     return np.sign(data) * np.logical_not(data == 0) * tstep
 
 
+@jit()
+def _union_find_cc(n, row, col):
+    """Connected components via union-find on an edge list.
+
+    Faster than scipy.sparse.csgraph.connected_components for small-to-medium
+    graphs because it avoids sparse matrix construction and CSC conversion.
+    """
+    parent = np.arange(n)
+    rank = np.zeros(n, dtype=np.int32)
+    for i in range(len(row)):
+        # Find root of row[i]
+        a = row[i]
+        while parent[a] != a:
+            parent[a] = parent[parent[a]]  # path halving
+            a = parent[a]
+        # Find root of col[i]
+        b = col[i]
+        while parent[b] != b:
+            parent[b] = parent[parent[b]]
+            b = parent[b]
+        if a != b:
+            if rank[a] < rank[b]:
+                parent[a] = b
+            elif rank[a] > rank[b]:
+                parent[b] = a
+            else:
+                parent[b] = a
+                rank[a] += 1
+    # Final path compression + relabel to 0..n_components-1
+    label_map = -np.ones(n, dtype=np.intp)
+    next_label = np.intp(0)
+    components = np.empty(n, dtype=np.intp)
+    for i in range(n):
+        a = i
+        while parent[a] != a:
+            a = parent[a]
+        parent[i] = a
+        if label_map[a] == -1:
+            label_map[a] = next_label
+            next_label += 1
+        components[i] = label_map[a]
+    return components
+
+
+@jit()
+def _fused_ccl(x_in, adj_row, adj_col, n_active, active_idx):
+    """Filter edges to active vertices and run union-find in one pass.
+
+    Avoids creating intermediate edge arrays, global_to_local mapping,
+    and sparse matrix construction.
+    """
+    global_to_local = np.empty(len(x_in), dtype=np.intp)
+    for i in range(n_active):
+        global_to_local[active_idx[i]] = i
+    parent = np.arange(n_active)
+    rank = np.zeros(n_active, dtype=np.int32)
+    for i in range(len(adj_row)):
+        r = adj_row[i]
+        c = adj_col[i]
+        if x_in[r] and x_in[c]:
+            lr = global_to_local[r]
+            lc = global_to_local[c]
+            a = lr
+            while parent[a] != a:
+                parent[a] = parent[parent[a]]
+                a = parent[a]
+            b = lc
+            while parent[b] != b:
+                parent[b] = parent[parent[b]]
+                b = parent[b]
+            if a != b:
+                if rank[a] < rank[b]:
+                    parent[a] = b
+                elif rank[a] > rank[b]:
+                    parent[b] = a
+                else:
+                    parent[b] = a
+                    rank[a] += 1
+    # Final path compression + relabel
+    label_map = -np.ones(n_active, dtype=np.intp)
+    next_label = np.intp(0)
+    components = np.empty(n_active, dtype=np.intp)
+    for i in range(n_active):
+        a = i
+        while parent[a] != a:
+            a = parent[a]
+        parent[i] = a
+        if label_map[a] == -1:
+            label_map[a] = next_label
+            next_label += 1
+        components[i] = label_map[a]
+    return components
+
+
 def _get_clusters_spatial(s, neighbors):
     """Form spatial clusters using neighbor lists.
 
@@ -286,10 +380,85 @@ def _get_clusters_st(x_in, neighbors, max_step=1):
         return []
 
 
-def _get_components(x_in, adjacency, return_list=True):
+def _get_components(x_in, adjacency, return_list=True, return_labels=False):
     """Get connected components from a mask and a adjacency matrix."""
     if adjacency is False:
-        components = np.arange(len(x_in))
+        if return_labels:
+            idx = np.where(x_in)[0]
+            if len(idx) == 0:
+                return None, None
+            return idx, np.arange(len(idx))
+        if return_list:
+            idx = np.where(x_in)[0]
+            return [idx[i : i + 1] for i in range(len(idx))]
+        return np.arange(len(x_in))
+    if return_labels:
+        # Fast path for permutation loop: return raw component labels
+        # so caller can compute sums via bincount (no argsort/split needed).
+        # Uses fused Numba union-find which iterates edges once, avoiding
+        # sparse matrix construction and scipy's CSC conversion + BFS.
+        idx = np.where(x_in)[0]
+        n_active = len(idx)
+        if n_active == 0:
+            return None, None
+        if has_numba:
+            _row = adjacency.row
+            _col = adjacency.col
+            if _row.dtype != np.intp:
+                _row = _row.astype(np.intp)
+            if _col.dtype != np.intp:
+                _col = _col.astype(np.intp)
+            if idx.dtype != np.intp:
+                idx = idx.astype(np.intp)
+            components = _fused_ccl(x_in, _row, _col, n_active, idx)
+        else:
+            global_to_local = np.empty(adjacency.shape[0], dtype=np.intp)
+            global_to_local[idx] = np.arange(n_active)
+            edge_mask = np.logical_and(
+                x_in[adjacency.row], x_in[adjacency.col]
+            )
+            row = global_to_local[adjacency.row[edge_mask]]
+            col = global_to_local[adjacency.col[edge_mask]]
+            self_idx = np.arange(n_active)
+            row = np.concatenate((row, self_idx))
+            col = np.concatenate((col, self_idx))
+            data = np.ones(len(row), dtype=np.float64)
+            small_adj = sparse.coo_array(
+                (data, (row, col)), shape=(n_active, n_active)
+            )
+            _, components = connected_components(small_adj)
+        return idx, components
+    if return_list:
+        # Optimized path: build a compact graph of only the active vertices
+        # so that connected_components and groupby operate on a much smaller
+        # array (e.g. ~1K vertices instead of ~20K).
+        idx = np.where(x_in)[0]
+        n_active = len(idx)
+        if n_active == 0:
+            return []
+        # Map global vertex indices to compact local indices (0..n_active-1)
+        global_to_local = np.empty(adjacency.shape[0], dtype=np.intp)
+        global_to_local[idx] = np.arange(n_active)
+        # Keep only edges between active vertices, remapped to local indices
+        edge_mask = np.logical_and(x_in[adjacency.row], x_in[adjacency.col])
+        row = global_to_local[adjacency.row[edge_mask]]
+        col = global_to_local[adjacency.col[edge_mask]]
+        # Self-loops ensure isolated active vertices get their own component
+        self_idx = np.arange(n_active)
+        row = np.concatenate((row, self_idx))
+        col = np.concatenate((col, self_idx))
+        data = np.ones(len(row), dtype=np.float64)
+        small_adj = sparse.coo_array(
+            (data, (row, col)), shape=(n_active, n_active)
+        )
+        _, components = connected_components(small_adj)
+        # Group local indices by component, then map back to global indices.
+        # All components are valid clusters (every vertex is active).
+        order = np.argsort(components, kind="stable")
+        counts = np.bincount(components)
+        splits = np.cumsum(counts[:-1])
+        global_order = idx[order]
+        return list(np.split(global_order, splits))
     else:
         mask = np.logical_and(x_in[adjacency.row], x_in[adjacency.col])
         data = adjacency.data[mask]
@@ -302,17 +471,6 @@ def _get_components(x_in, adjacency, return_list=True):
         data = np.concatenate((data, np.ones(len(idx), dtype=data.dtype)))
         adjacency = sparse.coo_array((data, (row, col)), shape=shape)
         _, components = connected_components(adjacency)
-    if return_list:
-        start = np.min(components)
-        stop = np.max(components)
-        comp_list = [list() for i in range(start, stop + 1, 1)]
-        mask = np.zeros(len(comp_list), dtype=bool)
-        for ii, comp in enumerate(components):
-            comp_list[comp].append(ii)
-            mask[comp] += x_in[ii]
-        clusters = [np.array(k) for k, m in zip(comp_list, mask) if m]
-        return clusters
-    else:
         return components
 
 
@@ -326,6 +484,7 @@ def _find_clusters(
     partitions=None,
     t_power=1,
     show_info=False,
+    _sums_only=False,
 ):
     """Find all clusters which are above/below a certain threshold.
 
@@ -430,8 +589,10 @@ def _find_clusters(
         tfce = False
 
     # include all points by default
-    if include is None:
-        include = np.ones(x.shape, dtype=bool)
+    _has_include = include is not None
+    if _has_include is False:
+        if not _sums_only:
+            include = np.ones(x.shape, dtype=bool)
 
     if tail in [0, 1] and not np.all(np.diff(thresholds) > 0):
         raise ValueError("Thresholds must be monotonically increasing")
@@ -444,20 +605,38 @@ def _find_clusters(
     for ti, thresh in enumerate(thresholds):
         # these need to be reset on each run
         clusters = list()
-        if tail == 0:
-            x_ins = [
-                np.logical_and(x > thresh, include),
-                np.logical_and(x < -thresh, include),
-            ]
-        elif tail == -1:
-            x_ins = [np.logical_and(x < thresh, include)]
-        else:  # tail == 1
-            x_ins = [np.logical_and(x > thresh, include)]
+        if _has_include:
+            if tail == 0:
+                x_ins = [
+                    np.logical_and(x > thresh, include),
+                    np.logical_and(x < -thresh, include),
+                ]
+            elif tail == -1:
+                x_ins = [np.logical_and(x < thresh, include)]
+            else:  # tail == 1
+                x_ins = [np.logical_and(x > thresh, include)]
+        else:
+            # Skip include mask allocation — all points are included
+            if tail == 0:
+                x_ins = [x > thresh, x < -thresh]
+            elif tail == -1:
+                x_ins = [x < thresh]
+            else:  # tail == 1
+                x_ins = [x > thresh]
         # loop over tails
         for x_in in x_ins:
             if np.any(x_in):
                 out = _find_clusters_1dir_parts(
-                    x, x_in, adjacency, max_step, partitions, t_power, ndimage
+                    x,
+                    x_in,
+                    adjacency,
+                    max_step,
+                    partitions,
+                    t_power,
+                    ndimage,
+                    # TFCE needs cluster lists for scoring; skip only when
+                    # the caller truly doesn't need them.
+                    _sums_only=_sums_only and not tfce,
                 )
                 clusters += out[0]
                 sums.append(out[1])
@@ -490,12 +669,12 @@ def _find_clusters(
 
 
 def _find_clusters_1dir_parts(
-    x, x_in, adjacency, max_step, partitions, t_power, ndimage
+    x, x_in, adjacency, max_step, partitions, t_power, ndimage, _sums_only=False
 ):
     """Deal with partitions, and pass the work to _find_clusters_1dir."""
     if partitions is None:
         clusters, sums = _find_clusters_1dir(
-            x, x_in, adjacency, max_step, t_power, ndimage
+            x, x_in, adjacency, max_step, t_power, ndimage, _sums_only
         )
     else:
         # cluster each partition separately
@@ -503,14 +682,18 @@ def _find_clusters_1dir_parts(
         sums = list()
         for p in range(np.max(partitions) + 1):
             x_i = np.logical_and(x_in, partitions == p)
-            out = _find_clusters_1dir(x, x_i, adjacency, max_step, t_power, ndimage)
+            out = _find_clusters_1dir(
+                x, x_i, adjacency, max_step, t_power, ndimage, _sums_only
+            )
             clusters += out[0]
             sums.append(out[1])
         sums = np.concatenate(sums)
     return clusters, sums
 
 
-def _find_clusters_1dir(x, x_in, adjacency, max_step, t_power, ndimage):
+def _find_clusters_1dir(
+    x, x_in, adjacency, max_step, t_power, ndimage, _sums_only=False
+):
     """Actually call the clustering algorithm."""
     if adjacency is None:
         labels, n_labels = ndimage.label(x_in)
@@ -547,6 +730,20 @@ def _find_clusters_1dir(x, x_in, adjacency, max_step, t_power, ndimage):
             )
         if isinstance(adjacency, sparse.spmatrix):
             adjacency = sparse.coo_array(adjacency)
+        if _sums_only and (sparse.issparse(adjacency) or adjacency is False):
+            # Fast path: compute sums directly from component labels via
+            # bincount, skipping cluster list construction (argsort/split).
+            idx, components = _get_components(
+                x_in, adjacency, return_labels=True
+            )
+            if idx is None:
+                return [], np.atleast_1d(np.array([]))
+            if t_power == 1:
+                sums = np.bincount(components, weights=x[idx])
+            else:
+                vals = np.sign(x[idx]) * np.abs(x[idx]) ** t_power
+                sums = np.bincount(components, weights=vals)
+            return [], np.atleast_1d(sums)
         if sparse.issparse(adjacency) or adjacency is False:
             clusters = _get_components(x_in, adjacency)
         elif isinstance(adjacency, list):  # use temporal adjacency
@@ -555,10 +752,20 @@ def _find_clusters_1dir(x, x_in, adjacency, max_step, t_power, ndimage):
             raise TypeError(
                 f"adjacency must be a sparse array or list, got {type(adjacency)}"
             )
-        if t_power == 1:
-            sums = [_masked_sum(x, c) for c in clusters]
+        if not clusters:
+            sums = np.array([])
         else:
-            sums = [_masked_sum_power(x, c, t_power) for c in clusters]
+            # Vectorized cluster sums via reduceat (avoids per-cluster calls)
+            all_idx = np.concatenate(clusters)
+            lengths = np.array([len(c) for c in clusters])
+            offsets = np.empty(len(clusters), dtype=np.intp)
+            offsets[0] = 0
+            np.cumsum(lengths[:-1], out=offsets[1:])
+            if t_power == 1:
+                sums = np.add.reduceat(x[all_idx], offsets)
+            else:
+                vals = np.sign(x[all_idx]) * np.abs(x[all_idx]) ** t_power
+                sums = np.add.reduceat(vals, offsets)
 
     return clusters, np.atleast_1d(sums)
 
@@ -707,6 +914,7 @@ def _do_permutations(
             partitions=partitions,
             include=include,
             t_power=t_power,
+            _sums_only=True,
         )
         perm_clusters_sums = out[1]
 
@@ -745,6 +953,20 @@ def _do_1samp_permutations(
     # allocate space for output
     max_cluster_sums = np.empty(len(orders), dtype=np.double)
 
+    # Fast path: precompute sum-of-squares for default ttest_1samp_no_p.
+    # For sign-flips s (±1), s²=1, so sum(X²) is constant across perms.
+    # This avoids two full-array multiplies and the np.var call per perm.
+    # Works regardless of buffer_size since it uses signs @ X (a matrix-vector
+    # multiply that is more memory-efficient than the buffer approach).
+    _use_fast_ttest = stat_fun is ttest_1samp_no_p
+    if _use_fast_ttest:
+        _sum_sq = np.sum(X**2, axis=0)
+        _sqrt_n_nm1 = np.sqrt(n_samp * (n_samp - 1))
+        # Pre-allocate work arrays to avoid repeated 20K allocations
+        _mean_s = np.empty(n_vars, dtype=np.float64)
+        _denom_sq = np.empty(n_vars, dtype=np.float64)
+        _t_buf = np.empty(n_vars, dtype=np.float64)
+
     if buffer_size is not None:
         # allocate a buffer so we don't need to allocate memory in loop
         X_flip_buffer = np.empty((n_samp, buffer_size), dtype=X.dtype)
@@ -753,11 +975,25 @@ def _do_1samp_permutations(
         assert isinstance(order, np.ndarray)
         # new surrogate data with specified sign flip
         assert order.size == n_samp  # should be guaranteed by parent
-        signs = 2 * order[:, None].astype(int) - 1
-        if not np.all(np.equal(np.abs(signs), 1)):
-            raise ValueError("signs from rng must be +/- 1")
 
-        if buffer_size is None:
+        if _use_fast_ttest:
+            # Precomputed t-test using pre-allocated buffers.
+            # signs_1d: order contains bools, 2*order-1 gives ±1 directly.
+            signs_1d = 2.0 * order - 1.0
+            np.dot(signs_1d, X, out=_mean_s)
+            _mean_s /= n_samp
+            np.multiply(_mean_s, _mean_s, out=_denom_sq)
+            _denom_sq *= -n_samp
+            _denom_sq += _sum_sq
+            np.maximum(_denom_sq, 0, out=_denom_sq)
+            np.sqrt(_denom_sq, out=_denom_sq)
+            np.divide(_mean_s, _denom_sq, out=_t_buf)
+            _t_buf *= _sqrt_n_nm1
+            t_obs_surr = _t_buf
+        elif buffer_size is None:
+            signs = 2 * order[:, None].astype(int) - 1
+            if not np.all(np.equal(np.abs(signs), 1)):
+                raise ValueError("not all entries are +/- 1")
             # be careful about non-writable memmap (GH#1507)
             if X.flags.writeable:
                 X *= signs
@@ -768,6 +1004,9 @@ def _do_1samp_permutations(
             else:
                 t_obs_surr = stat_fun(X * signs)
         else:
+            signs = 2 * order[:, None].astype(int) - 1
+            if not np.all(np.equal(np.abs(signs), 1)):
+                raise ValueError("not all entries are +/- 1")
             # only sign-flip a small data buffer, so we need less memory
             t_obs_surr = np.empty(n_vars, dtype=X.dtype)
 
@@ -795,6 +1034,7 @@ def _do_1samp_permutations(
             partitions=partitions,
             include=include,
             t_power=t_power,
+            _sums_only=True,
         )
         perm_clusters_sums = out[1]
         if len(perm_clusters_sums) > 0:
