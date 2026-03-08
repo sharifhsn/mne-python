@@ -260,6 +260,51 @@ to NumPy/SciPy). They are candidates for Rust replacement:
 - `mne/transforms.py` (3 fns): Quaternion algebra
 - `mne/decoding/time_delaying_ridge.py` (2 fns): Toeplitz matrix ops
 
+### Performance Optimization Progress
+
+See `gpu_accel/perf-log.md` for detailed benchmark tables and results.
+
+**Completed optimizations** (cumulative 22.4x on 128-perm fsaverage test):
+
+1. **Vectorize loop** (v1): Replaced Python for-loop in `_get_components` with
+   `bincount`/`argsort`/`split`. Eliminated per-vertex Python overhead.
+2. **Reindex active-only** (v2): Build compact graph of only supra-threshold
+   vertices before `connected_components`. Shrinks CCL input from ~20K to ~1K
+   vertices. Also eliminates `has_sig` filtering (all compact-graph components
+   are valid). This was the biggest single win (~5x).
+3. **Vectorize cluster sums** (v3): Replaced `[_masked_sum(x, c) for c in clusters]`
+   loop (~1500 calls) with single `np.add.reduceat` in `_find_clusters_1dir`.
+4. **Skip np.split in permutation loop** (v4): Added `_sums_only` fast path.
+   During permutations, `_get_components(return_labels=True)` returns raw
+   `(idx, components)`, and sums are computed via `np.bincount` — skips
+   `argsort`/`split`/`concatenate` entirely.
+5. **Numba union-find + precomputed t-test** (v5): Two optimizations:
+   - `_fused_ccl` Numba JIT replaces scipy `connected_components` in the
+     permutation loop (3.5-11x faster, avoids sparse matrix construction).
+   - Precomputed `sum(X²)` exploits s²=1 identity for sign-flip permutations,
+     replacing two full-array multiplies + `np.var` with a matrix-vector multiply.
+
+**Current per-permutation breakdown** (fsaverage ico-5, 20K vertices, ~0.3ms):
+- Numba UF edge iteration: ~50%
+- Threshold comparison + np.where: ~20%
+- Precomputed ttest (signs @ X): ~20%
+- bincount sums: ~10%
+
+**Remaining opportunities**:
+- Fused GPU pipeline (sign-flip + ttest + threshold + CCL + reduce all on GPU)
+- The standard spatio-temporal path uses `_get_clusters_st` (Numba BFS), not
+  `_get_components` — optimizing that path is separate
+
+**Optimization workflow** (follow for every optimization):
+1. Profile to find the bottleneck (instrument with `time.perf_counter()`)
+2. Implement the fix
+3. **Adversarial code review**: edge cases, type variations (bool vs int `x_in`),
+   downstream consumers, view-vs-copy safety, ordering invariants
+4. **Parity + performance benchmarks**: verify identical output across varying
+   density, graph size, edge cases, real fsaverage data, end-to-end permutation
+   test. Use the old implementation as reference.
+5. **Record in `gpu_accel/perf-log.md`**: what changed, why, benchmark tables
+
 ### Relevant MNE Issues/PRs
 
 - [#13002](https://github.com/mne-tools/mne-python/pull/13002) — CUDA zero-copy (closed)
