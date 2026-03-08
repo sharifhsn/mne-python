@@ -1,0 +1,98 @@
+Benchmark started: 2026-03-08T06:56:46.006056
+GPU: NVIDIA GeForce RTX 2070 SUPER
+CuPy: 14.0.1
+NumPy: 2.4.2
+
+======================================================================
+PART 1: Isolated CCL benchmark (real ico-5 cortical mesh topology)
+======================================================================
+
+Spatial adjacency: 20,484 vertices, nnz=143,364
+
+n_times     n_tests  sig_nodes      sub_nnz    CPU_ms    GPU_ms  Speedup
+---------------------------------------------------------------------------
+     25     512,100    153,395      670,804      24.6      41.6    0.59x
+     50   1,024,200    307,196    1,348,634      45.0      57.6    0.78x
+     75   1,536,300    460,871    2,023,438      76.1      72.7    1.05x
+    100   2,048,400    614,542    2,700,360     102.3      86.6    1.18x
+    150   3,072,600    922,278    4,055,348     170.5     118.2    1.44x
+    200   4,096,800  1,229,218    5,402,978     231.9     143.7    1.61x
+    250   5,121,000  1,534,767    6,746,434     290.1     173.9    1.67x
+    350   7,169,400  2,149,260    9,449,826     394.1     231.4    1.70x
+    500  10,242,000  3,072,702   13,516,308     579.0     320.2    1.81x
+
+======================================================================
+PART 2: Full permutation cluster test — CPU vs GPU
+  CPU path: default (neighbor-list + Numba _get_clusters_st)
+  GPU path: full ST adjacency + CuPy _get_components
+======================================================================
+
+Loading MNE sample data...
+  n_subjects=7, p<0.05 (t=2.45), n_perms=128, n_tests=307,260
+    CPU 22.7s  GPU 56.9s  => 0.40x  (clusters: CPU=9118 GPU=9115, match=False)
+  n_subjects=7, p<0.01 (t=3.71), n_perms=128, n_tests=307,260
+    CPU 4.5s  GPU 55.7s  => 0.08x  (clusters: CPU=2481 GPU=2481, match=True)
+
+  n_subjects=15, p<0.05 (t=2.14), n_perms=512, n_tests=307,260
+    CPU 192.2s  GPU 471.2s  => 0.41x  (clusters: CPU=8615 GPU=8606, match=False)
+  n_subjects=15, p<0.01 (t=2.98), n_perms=512, n_tests=307,260
+    CPU 43.8s  GPU 451.0s  => 0.10x  (clusters: CPU=2746 GPU=2742, match=False)
+
+  n_subjects=20, p<0.05 (t=2.09), n_perms=512, n_tests=307,260
+    CPU 197.6s  GPU 471.1s  => 0.42x  (clusters: CPU=8263 GPU=8259, match=False)
+  n_subjects=20, p<0.01 (t=2.86), n_perms=512, n_tests=307,260
+    CPU 47.4s  GPU 460.6s  => 0.10x  (clusters: CPU=2745 GPU=2741, match=False)
+
+  n_subjects=30, p<0.05 (t=2.05), n_perms=512, n_tests=307,260
+    CPU 200.2s  GPU 479.2s  => 0.42x  (clusters: CPU=7873 GPU=7856, match=False)
+  n_subjects=30, p<0.01 (t=2.76), n_perms=512, n_tests=307,260
+    CPU 53.2s  GPU 463.6s  => 0.11x  (clusters: CPU=2874 GPU=2874, match=True)
+
+======================================================================
+PART 3: Synthetic stress test (larger time windows)
+======================================================================
+
+  N=20, T=50, tests=1,024,200, perms=256, t_thr=2.09
+    CPU 446.2s  GPU 743.3s  => 0.60x  (clusters: CPU=18582 GPU=18403)
+  N=20, T=100, tests=2,048,400, perms=256, t_thr=2.09
+    CPU 910.6s  GPU 1442.0s  => 0.63x  (clusters: CPU=36342 GPU=36283)
+  N=20, T=150, tests=3,072,600, perms=128, t_thr=2.09
+    CPU 689.5s  GPU 1064.5s  => 0.65x  (clusters: CPU=55483 GPU=55448)
+
+======================================================================
+SUMMARY — Isolated CCL (Part 1)
+======================================================================
+
+The CCL step (connected_components) scales like this on your RTX 2070 SUPER:
+
+n_times     n_tests    CPU_ms    GPU_ms  Speedup
+--------------------------------------------------
+     25     512,100      24.6      41.6    0.59x
+     50   1,024,200      45.0      57.6    0.78x
+     75   1,536,300      76.1      72.7    1.05x <-- GPU crossover
+    100   2,048,400     102.3      86.6    1.18x <-- GPU WINS
+    150   3,072,600     170.5     118.2    1.44x <-- GPU WINS
+    200   4,096,800     231.9     143.7    1.61x <-- GPU WINS
+    250   5,121,000     290.1     173.9    1.67x <-- GPU WINS
+    350   7,169,400     394.1     231.4    1.70x <-- GPU WINS
+    500  10,242,000     579.0     320.2    1.81x <-- GPU WINS
+
+======================================================================
+CONCLUSIONS
+======================================================================
+
+For RAPID ITERATION benchmarking, use these parameters:
+  - Isolated CCL: n_times=250 (5.1M tests, 30% density) => ~1.7x GPU speedup
+  - Full permutation test: see Part 2/3 results above
+
+The CuPy drop-in gives modest speedup (1.2-2x) only when:
+  1. The full spatio-temporal adjacency is pre-built (forcing _get_components path)
+  2. The graph has >1M total tests
+  3. >20% of vertices are supra-threshold
+
+For dramatic speedup (>5x), the fused GPU pipeline (Path 3) is needed:
+  - Entire permutation loop on GPU
+  - No per-permutation CPU<->GPU transfers
+  - sign-flip + t-test + threshold + CCL + reduce in one dispatch
+
+Benchmark finished: 2026-03-08T09:27:00.211861

@@ -22,7 +22,10 @@ try:
     from cupyx.scipy import sparse as cp_sparse
     from cupyx.scipy.sparse.csgraph import connected_components as gpu_cc
     HAS_CUPY = True
-    print(f"CuPy {cp.__version__} detected, CUDA device: {cp.cuda.Device().name}")
+    _dev_name = cp.cuda.runtime.getDeviceProperties(0)["name"]
+    if isinstance(_dev_name, bytes):
+        _dev_name = _dev_name.decode()
+    print(f"CuPy {cp.__version__} detected, CUDA device: {_dev_name}")
 except ImportError:
     HAS_CUPY = False
     print("CuPy not available. Install with: uv pip install cupy-cuda12x")
@@ -42,9 +45,37 @@ _original_get_components = cl._get_components
 def _gpu_get_components(x_in, adjacency, return_list=True):
     """GPU-accelerated connected components via CuPy."""
     if adjacency is False:
-        components = np.arange(len(x_in))
+        if return_list:
+            idx = np.where(x_in)[0]
+            return [idx[i : i + 1] for i in range(len(idx))]
+        return np.arange(len(x_in))
+    if return_list:
+        idx = np.where(x_in)[0]
+        n_active = len(idx)
+        if n_active == 0:
+            return []
+        global_to_local = np.empty(adjacency.shape[0], dtype=np.intp)
+        global_to_local[idx] = np.arange(n_active)
+        edge_mask = np.logical_and(x_in[adjacency.row], x_in[adjacency.col])
+        row = global_to_local[adjacency.row[edge_mask]]
+        col = global_to_local[adjacency.col[edge_mask]]
+        self_idx = np.arange(n_active)
+        row = np.concatenate((row, self_idx))
+        col = np.concatenate((col, self_idx))
+        data = np.ones(len(row), dtype=np.float32)
+        # Transfer to GPU and run connected components
+        adj_gpu = cp_sparse.coo_matrix(
+            (cp.asarray(data), (cp.asarray(row), cp.asarray(col))),
+            shape=(n_active, n_active),
+        )
+        _, components_gpu = gpu_cc(adj_gpu, directed=False)
+        components = cp.asnumpy(components_gpu)
+        order = np.argsort(components, kind="stable")
+        counts = np.bincount(components)
+        splits = np.cumsum(counts[:-1])
+        global_order = idx[order]
+        return list(np.split(global_order, splits))
     else:
-        # Build subgraph of significant vertices (same logic as original)
         mask = np.logical_and(x_in[adjacency.row], x_in[adjacency.col])
         data = adjacency.data[mask]
         row = adjacency.row[mask]
@@ -54,27 +85,13 @@ def _gpu_get_components(x_in, adjacency, return_list=True):
         row = np.concatenate((row, idx))
         col = np.concatenate((col, idx))
         data = np.concatenate((data, np.ones(len(idx), dtype=data.dtype)))
-
-        # Transfer to GPU and run connected components
         adj_gpu = cp_sparse.coo_matrix(
-            (cp.asarray(data), (cp.asarray(row), cp.asarray(col))),
+            (cp.asarray(data.astype(np.float32)),
+             (cp.asarray(row), cp.asarray(col))),
             shape=shape,
         )
         _, components_gpu = gpu_cc(adj_gpu, directed=False)
-        components = cp.asnumpy(components_gpu)
-
-    if return_list:
-        start = np.min(components)
-        stop = np.max(components)
-        comp_list = [list() for i in range(start, stop + 1, 1)]
-        mask = np.zeros(len(comp_list), dtype=bool)
-        for ii, comp in enumerate(components):
-            comp_list[comp].append(ii)
-            mask[comp] += x_in[ii]
-        clusters = [np.array(k) for k, m in zip(comp_list, mask) if m]
-        return clusters
-    else:
-        return components
+        return cp.asnumpy(components_gpu)
 
 
 # Apply the patch

@@ -94,12 +94,82 @@ Typical dimensions:
 - **n_tests**: ~307,260
 - **adjacency**: 20,484 × 20,484 sparse (~123K nonzero entries, ~1 MB on GPU)
 
+## Empirical Results (2026-03-08, RTX 2070 SUPER)
+
+### Critical finding: wrong bottleneck target
+
+The original analysis identified `_get_components()` (SciPy sparse CCL) as the
+bottleneck. **This is incorrect.** In the standard spatio-temporal case:
+
+1. `_setup_adjacency()` detects that the spatial adjacency (20,484 × 20,484) is
+   smaller than `n_tests` (307,260) and converts it to a **neighbor list**.
+2. This routes clustering to `_get_clusters_st()` → `_get_clusters_spatial()`
+   (Numba JIT BFS on neighbor lists), **NOT** `_get_components()`.
+3. `_get_components()` is called **0 times** in the standard benchmark.
+
+### Profiled time breakdown (p<0.05, 128 perms)
+
+| Component | Time | % |
+|-----------|------|---|
+| `_get_clusters_st` (Numba BFS) | 21.4s | 91.9% |
+| `_find_clusters` overhead | 1.3s | 5.4% |
+| stat_fun + sign-flip | 0.6s | 2.7% |
+| **Total** | **23.3s** | |
+
+The bottleneck claim (~97% in CCL) is correct — but the CCL implementation
+is Numba BFS on neighbor lists, not SciPy sparse graph CCL.
+
+### CuPy drop-in results: GPU is SLOWER
+
+| Configuration | CPU | GPU | Speedup |
+|---------------|-----|-----|---------|
+| Full ST adjacency, p<0.05 | 23.5s | 61.2s | **0.38x** |
+| Isolated CCL, 20K vertices | 1.0ms | 14.8ms | **0.07x** |
+| Isolated CCL, 500K vertices | 24.6ms | 40.7ms | **0.60x** |
+| Isolated CCL, 1M vertices | 67ms | 63ms | **1.07x** (crossover) |
+| Isolated CCL, 2M vertices | 217ms | 117ms | **1.85x** |
+| Isolated CCL, 5M vertices | 694ms | 302ms | **2.30x** |
+
+GPU only wins at >1M vertices per call. MNE's typical graph has 307K nodes
+with only 1K-10K supra-threshold per permutation.
+
+### Why CuPy fails here
+
+1. **Kernel launch overhead**: ~15ms per `pylibcugraph.weakly_connected_components`
+   call, while CPU completes in <1ms for small subgraphs.
+2. **Transfer overhead**: Building COO matrix on CPU, transferring to GPU, and
+   copying labels back adds ~5ms per call.
+3. **Many small calls**: 128+ calls per test run (2 tails × n_permutations),
+   each on a different subgraph. GPU can't batch these.
+
+### Path 1 verdict: NOT VIABLE
+
+The CuPy drop-in approach cannot provide speedup for MNE's permutation cluster
+tests. The per-call overhead (~20ms) exceeds the CPU compute time (<1ms for
+typical subgraphs).
+
+### Revised plan
+
+Path 1 is eliminated. The viable approaches are:
+
+1. **Path 3 (fused GPU pipeline)**: Keep the entire permutation loop on GPU —
+   sign-flip, t-test, threshold, CCL, reduce — in a single dispatch. This
+   amortizes kernel launch overhead across all permutations. Expected: 10-50x.
+
+2. **Alternative: Numba CUDA**: Replace the Numba CPU JIT in `_get_clusters_spatial`
+   with Numba CUDA kernels. Same Python ecosystem, no Rust/PyO3 needed.
+   Lower effort than Path 3 but less potential speedup.
+
+3. **Alternative: batched GPU CCL**: Run CCL for multiple permutations in a single
+   GPU dispatch (e.g., batch 64 subgraphs into one kernel). Requires custom
+   CUDA kernel (not available in CuPy/pylibcugraph).
+
 ## Recommended Plan
 
-1. **Today**: Run `benchmark_cluster_cpu.py` to establish CPU baseline
-2. **This week**: Patch `_get_components` with CuPy backend, benchmark same data
-3. **If speedup confirmed**: Build wgpu+Rust cross-platform version
-4. **Then**: Open PR to MNE-Python with benchmarks
+1. ~~**Path 1**: CuPy drop-in~~ — **ELIMINATED** (GPU slower, see results above)
+2. **Next**: Prototype fused GPU pipeline (Path 3) or batched Numba CUDA
+3. **Key insight**: Must avoid per-permutation CPU↔GPU round-trips
+4. **Benchmark**: `benchmark_head_to_head.py` has the full comparison
 
 ## References
 
