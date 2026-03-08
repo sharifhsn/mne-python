@@ -35,6 +35,12 @@ doc = [
   "sphinxcontrib-towncrier >= 0.5.0a0",
   "sphinxcontrib-youtube",
 ]
+# GPU acceleration dependencies (this fork only, Linux + NVIDIA)
+# CuPy provides GPU-accelerated scipy.sparse.csgraph.connected_components
+# used by gpu_accel/patch_cupy_poc.py for permutation cluster tests
+gpu = [
+  "cupy-cuda12x >= 13.0; sys_platform == 'linux'",
+]
 # Dependencies in a separate group for uv lockfile generation, currently only used for
 # the 'old' environment CI test run
 lockfile_extras = [

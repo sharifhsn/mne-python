@@ -97,6 +97,7 @@ cover
 
 .venv/
 venv/
+uv.lock
 /*.json
 !codemeta.json
 .hypothesis/

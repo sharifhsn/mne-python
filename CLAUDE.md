@@ -56,26 +56,47 @@ vulture mne/ tools/vulture_allowlist.py
 This fork uses [uv](https://docs.astral.sh/uv/) for dependency management.
 MNE's `pyproject.toml` uses standard `[dependency-groups]` which uv supports natively.
 
-```bash
-# Create venv (Python 3.12 recommended for compatibility)
-uv venv --python 3.12 .venv
+**Preferred: `uv sync` (lockfile-based, reproducible)**
 
-# Install in development mode with test dependencies
-uv pip install -e . --group test
+```bash
+# Create venv + install in dev mode with test deps (creates uv.lock)
+uv sync --python 3.12 --group test
 
 # Install with all optional dependencies (no Qt)
-uv pip install -e ".[full-no-qt]" --group test
+uv sync --python 3.12 --group test --extra full-no-qt
 
 # Install with CuPy for GPU experiments (NVIDIA Linux only)
-uv pip install -e ".[full-no-qt]" --group test cupy-cuda12x
+uv sync --python 3.12 --group test --group gpu
+
+# Full setup: optional deps + GPU + tests
+uv sync --python 3.12 --group test --group gpu --extra full-no-qt
 
 # Verify installation
 .venv/bin/python -c "import mne; print(mne.__version__)"
 ```
 
-Note: MNE uses `[dependency-groups]` (PEP 735), not `[project.optional-dependencies]`
-for dev/test deps. Use `--group test` not `-e ".[test]"`. The `[full]`, `[full-no-qt]`,
-`[hdf5]` extras ARE in `[project.optional-dependencies]` and work normally.
+**Alternative: `uv pip install` (no lockfile, more manual)**
+
+```bash
+# Create venv manually first
+uv venv --python 3.12 .venv
+
+# Install in development mode with test dependencies
+uv pip install -e . --group test
+
+# Install with CuPy (NVIDIA Linux only)
+uv pip install -e . --group test --group gpu
+```
+
+**Key notes:**
+- MNE uses `[dependency-groups]` (PEP 735), not `[project.optional-dependencies]`
+  for dev/test deps. Use `--group test` not `-e ".[test]"`.
+- The `[full]`, `[full-no-qt]`, `[hdf5]` extras ARE in `[project.optional-dependencies]`
+  and work with `--extra`.
+- The `gpu` group (this fork only) installs `cupy-cuda12x` on Linux.
+  CuPy wheels come from PyPI directly — no custom index URL needed.
+- `uv sync` creates a `uv.lock` lockfile for reproducibility. The lockfile is
+  gitignored since this is a fork.
 
 ## Architecture
 
