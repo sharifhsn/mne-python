@@ -1,0 +1,45 @@
+# ── build ────────────────────────────────────────────────────────────────
+# Target: linux/amd64 (c7a.4xlarge = AMD EPYC)
+FROM python:3.12-slim-bookworm AS builder
+COPY --from=ghcr.io/astral-sh/uv:latest /uv /uvx /bin/
+
+WORKDIR /app
+
+# Copy full source (hatch-vcs needs .git for versioning, but we fake it)
+COPY . /app
+
+# Install MNE in non-editable mode with test dependencies.
+# SETUPTOOLS_SCM_PRETEND_VERSION avoids needing .git metadata.
+RUN --mount=type=cache,target=/root/.cache/uv \
+    SETUPTOOLS_SCM_PRETEND_VERSION=1.9.0.dev0 \
+    uv pip install --python /usr/local/bin/python3 \
+    -e ".[full-no-qt]" --group test
+
+# ── runtime ──────────────────────────────────────────────────────────────
+FROM python:3.12-slim-bookworm AS runtime
+
+RUN apt-get update && apt-get install -y --no-install-recommends \
+        ca-certificates curl unzip && \
+    rm -rf /var/lib/apt/lists/*
+
+# hyperfine (amd64 .deb — matches target platform)
+ARG HYPERFINE_VERSION=1.19.0
+RUN curl -sL "https://github.com/sharkdp/hyperfine/releases/download/v${HYPERFINE_VERSION}/hyperfine_${HYPERFINE_VERSION}_amd64.deb" \
+    -o /tmp/hf.deb && dpkg -i /tmp/hf.deb && rm /tmp/hf.deb
+
+# AWS CLI (for S3 data download at container start)
+RUN curl -sL "https://awscli.amazonaws.com/awscli-exe-linux-x86_64.zip" -o /tmp/awscli.zip && \
+    cd /tmp && unzip -q awscli.zip && ./aws/install && \
+    rm -rf /tmp/aws /tmp/awscli.zip
+
+# Copy site-packages from the builder (uv pip install goes into system python)
+COPY --from=builder /usr/local/lib/python3.12/site-packages /usr/local/lib/python3.12/site-packages
+COPY --from=builder /usr/local/bin /usr/local/bin
+
+# Copy benchmark scripts and the MNE source (editable install needs it)
+COPY --from=builder /app /app
+
+COPY scripts/bench-entrypoint.sh /entrypoint.sh
+RUN chmod +x /entrypoint.sh
+
+ENTRYPOINT ["/entrypoint.sh"]
